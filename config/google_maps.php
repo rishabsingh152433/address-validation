@@ -11,6 +11,7 @@ return [
     |
     */
     'api_key' => env('GOOGLE_MAPS_API_KEY'),
+    'timeout' => (int) env('GOOGLE_MAPS_TIMEOUT', 10),
     
 
     // base endpoints (change if you route via proxy)

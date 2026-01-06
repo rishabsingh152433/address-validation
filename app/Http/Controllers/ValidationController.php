@@ -19,7 +19,8 @@ class ValidationController extends Controller
 
         $result = $this->validationService->validate(
             $data['raw_address'],
-            $data['tenant_id'] ?? null
+            $data['tenant_id'] ?? null,
+            $data['place_id'] ?? null // ✅ NEW (optional)
         );
 
         return response()->json([
@@ -27,7 +28,7 @@ class ValidationController extends Controller
             'data'    => $result,
         ]);
     }
-}
+ }
 
 
 

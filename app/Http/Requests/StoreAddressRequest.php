@@ -26,6 +26,8 @@ class StoreAddressRequest extends FormRequest
           return [
              'raw_address' => ['required', 'string', 'min:3'],
             'tenant_id'   => ['nullable', 'integer'],
+            'place_id' => ['nullable','string','max:255'],
+
         ];
     }
 
