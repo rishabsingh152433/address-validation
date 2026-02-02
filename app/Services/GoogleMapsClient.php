@@ -9,22 +9,43 @@ class GoogleMapsClient
     private string $apiKey;
     private int $timeout;
 
+    // ✅ HARDCODE: only Chile
+    private string $countryCode = 'CL';
+
     public function __construct(private string $key = '')
     {
         $this->apiKey  = (string) config('google_maps.api_key');
         $this->timeout = (int) config('google_maps.timeout', 10);
     }
 
+    // ✅ Final check: allow only CL results
+    private function isCL(array $components): bool
+    {
+        foreach ($components as $c) {
+            if (in_array('country', $c['types'] ?? [], true)) {
+                return strtoupper((string) ($c['short_name'] ?? '')) === $this->countryCode;
+            }
+        }
+        return false;
+    }
+
     /**
-     * Resolve raw_address into candidates (address-like preferred).
-     * Always returns candidates when success=true.
-     *
-     * Return shape:
-     *  - success=false: {success:false, error:'...'}
-     *  - success=true:
-     *      status=valid => {success:true, status:'valid', data:{...}, candidates:[...]}
-     *      status=needs_confirmation => {success:true, status:'needs_confirmation', candidates:[...]}
+     * ✅ We will NOT expose candidates if:
+     * - not CL
+     * - type includes "country" (e.g., "Chile")
+     * - partial_match = true
      */
+    private function shouldExposeCandidate(array $mapped): bool
+    {
+        if (!$this->isCL($mapped['components'] ?? [])) return false;
+
+        if (in_array('country', $mapped['types'] ?? [], true)) return false;
+
+        if (!empty($mapped['partial_match'])) return false;
+
+        return true;
+    }
+
     public function resolve(string $rawAddress, ?string $placeId = null, int $maxCandidates = 5): array
     {
         \Log::info('GoogleMapsClient resolve started', ['raw_address' => $rawAddress, 'place_id' => $placeId]);
@@ -35,11 +56,14 @@ class GoogleMapsClient
             $rawAddress = trim($rawAddress);
             if ($rawAddress === '') return ['success' => false, 'error' => 'empty_address'];
 
-            // 0) If place_id provided => final answer directly
+            // 0) If place_id provided => final answer directly (CL only + expose rules)
             if (!empty($placeId)) {
                 $details = $this->placeDetails($placeId);
                 $mapped  = $this->mapPlaceDetails($details);
-                if ($mapped) {
+
+                if (!$mapped) return ['success' => false, 'error' => 'place_details_not_found'];
+
+                if ($this->shouldExposeCandidate($mapped)) {
                     return [
                         'success' => true,
                         'status' => 'valid',
@@ -47,7 +71,13 @@ class GoogleMapsClient
                         'candidates' => [$mapped],
                     ];
                 }
-                return ['success' => false, 'error' => 'place_details_not_found'];
+
+                // ✅ placeId exists but not allowed to show (not CL / or country-level / partial)
+                return [
+                    'success' => true,
+                    'status' => 'needs_confirmation',
+                    'candidates' => [],
+                ];
             }
 
             // 1) Collect place_ids from Autocomplete(types=address)
@@ -71,15 +101,18 @@ class GoogleMapsClient
             $placeIds = array_values(array_unique(array_filter($placeIds)));
             $placeIds = array_slice($placeIds, 0, $maxCandidates);
 
-            // 3) Place Details for each candidate
+            // 3) Place Details for each candidate (CL only + hide bad candidates)
             $candidates = [];
             foreach ($placeIds as $pid) {
                 $details = $this->placeDetails($pid);
                 $mapped  = $this->mapPlaceDetails($details);
-                if ($mapped) $candidates[] = $mapped;
+
+                if ($mapped && $this->shouldExposeCandidate($mapped)) {
+                    $candidates[] = $mapped;
+                }
             }
 
-            // If we have candidates => let service decide best/confirm
+            // ✅ If we have candidates => normal behavior
             if (count($candidates) === 1) {
                 return [
                     'success' => true,
@@ -96,14 +129,14 @@ class GoogleMapsClient
                 ];
             }
 
-            // 4) Last resort: Geocode
+            // 4) Last resort: Geocode (CL only + hide bad candidates)
             $geo = $this->geocode($rawAddress);
             if (($geo['status'] ?? '') === 'OK' && !empty($geo['results'])) {
                 $mapped = [];
                 foreach (array_slice($geo['results'], 0, $maxCandidates) as $r) {
-                    $mapped[] = $this->mapGeocodeResult($r);
+                    $m = $this->mapGeocodeResult($r);
+                    if ($m && $this->shouldExposeCandidate($m)) $mapped[] = $m;
                 }
-                $mapped = array_values(array_filter($mapped));
 
                 if (count($mapped) === 1) {
                     return [
@@ -122,7 +155,12 @@ class GoogleMapsClient
                 }
             }
 
-            return ['success' => false, 'error' => 'not_found'];
+            // ✅ IMPORTANT: No candidate details should be returned
+            return [
+                'success' => true,
+                'status' => 'needs_confirmation',
+                'candidates' => [],
+            ];
 
         } catch (\Throwable $e) {
             \Log::error('GoogleMapsClient resolve error', ['e' => $e->getMessage()]);
@@ -159,7 +197,8 @@ class GoogleMapsClient
             'https://maps.googleapis.com/maps/api/place/autocomplete/json',
             [
                 'input' => $input,
-                'types' => 'address', // ✅ avoid POI heavy results
+                'types' => 'address',
+                'components' => 'country:cl', // ✅ CL only
                 'key' => $this->apiKey,
             ]
         )->json() ?? ['status' => 'ERROR', 'predictions' => []];
@@ -173,6 +212,8 @@ class GoogleMapsClient
                 'input' => $input,
                 'inputtype' => 'textquery',
                 'fields' => 'place_id',
+                // ✅ Bias to Chile (Santiago center)
+                'locationbias' => 'circle:800000@-33.4489,-70.6693',
                 'key' => $this->apiKey,
             ]
         )->json() ?? ['status' => 'ERROR', 'candidates' => []];
@@ -196,6 +237,7 @@ class GoogleMapsClient
             'https://maps.googleapis.com/maps/api/geocode/json',
             [
                 'address' => $address,
+                'components' => 'country:cl', // ✅ CL only
                 'key' => $this->apiKey,
             ]
         )->json() ?? ['status' => 'ERROR', 'results' => []];
