@@ -26,6 +26,7 @@ class DatabaseSeeder extends Seeder
 
         $this->call([
           MasterAddressSeeder::class,
+          NormalizedFromMasterSeeder::class,
         ]);
     }
 }

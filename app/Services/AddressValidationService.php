@@ -29,10 +29,12 @@ class AddressValidationService
             $canonicalKey  = $this->canonicalKey($raw);
             $canonicalHash = $this->canonicalHash($canonicalKey);
 
-            // 0) canonical cache
+            // 0) canonical cache (exact)
             $normRow = NormalizedAddress::where('canonical_key_hash', $canonicalHash)->first();
             if ($normRow) {
-                $this->log($tenantId, $raw, $normRow->master_address_id, $normRow->id, 'normalized_match');
+                $this->log($tenantId, $raw, $normRow->master_address_id, $normRow->id, 'normalized_match', [
+                    'matched_by' => 'canonical_hash_exact'
+                ]);
                 $this->bumpTrustFromMatch($normRow, $normRow->masterAddress);
 
                 return [
@@ -46,7 +48,7 @@ class AddressValidationService
                 ];
             }
 
-            // 1) legacy normalized_key
+            // 1) legacy normalized_key (exact)
             $normRow = NormalizedAddress::where('normalized_key', $normKey)->first();
             if ($normRow) {
                 if (empty($normRow->canonical_key_hash)) {
@@ -55,7 +57,9 @@ class AddressValidationService
                     $normRow->save();
                 }
 
-                $this->log($tenantId, $raw, $normRow->master_address_id, $normRow->id, 'normalized_match');
+                $this->log($tenantId, $raw, $normRow->master_address_id, $normRow->id, 'normalized_match', [
+                    'matched_by' => 'normalized_key_exact'
+                ]);
                 $this->bumpTrustFromMatch($normRow, $normRow->masterAddress);
 
                 return [
@@ -65,6 +69,42 @@ class AddressValidationService
                         'formatted_address' => $normRow->validated_address ?? $normRow->masterAddress?->formatted_address,
                         'latitude' => $normRow->google_lat ?? $normRow->masterAddress?->google_lat,
                         'longitude' => $normRow->google_lng ?? $normRow->masterAddress?->google_lng,
+                    ],
+                ];
+            }
+
+            // =========================================================
+            //  NEW STEP (1.5): FUZZY DB MATCH (non-strict)
+            // =========================================================
+            $fuzzy = $this->fuzzyNormalizedMatch($raw, $canonicalKey);
+            if ($fuzzy) {
+                /** @var NormalizedAddress $row */
+                [$row, $score, $gap] = $fuzzy;
+
+                // backfill canonical fields if missing
+                if (empty($row->canonical_key_hash)) {
+                    $row->canonical_key = $row->canonical_key ?: $canonicalKey;
+                    $row->canonical_key_hash = $this->canonicalHash($row->canonical_key);
+                    $row->save();
+                }
+
+                $this->log($tenantId, $raw, $row->master_address_id, $row->id, 'normalized_match', [
+                    'matched_by' => 'fuzzy_db',
+                    'fuzzy' => true,
+                    'score' => $score,
+                    'gap' => $gap,
+                ]);
+
+                $this->bumpTrustFromMatch($row, $row->masterAddress);
+
+                return [
+                    'status' => 'valid',
+                    'source' => 'canonical_fuzzy',
+                    'confidence' => $score,
+                    'data' => [
+                        'formatted_address' => $row->validated_address ?? $row->masterAddress?->formatted_address,
+                        'latitude' => $row->google_lat ?? $row->masterAddress?->google_lat,
+                        'longitude' => $row->google_lng ?? $row->masterAddress?->google_lng,
                     ],
                 ];
             }
@@ -107,11 +147,8 @@ class AddressValidationService
                 return ['status' => 'invalid'];
             }
 
-            // =========================================================
-            // ✅ IMPORTANT FIX: if place_id provided, CONFIRM directly
-            // =========================================================
+            //  place_id confirm flow (unchanged)
             if (!empty($placeId)) {
-                // resolve() can return in data OR candidates
                 $d = $google['data'] ?? null;
 
                 if (!$d) {
@@ -146,7 +183,6 @@ class AddressValidationService
                         $canonicalHash
                     );
 
-                    // ✅ only allowed enum value (google_match)
                     $this->log($tenantId, $raw, $master->id, $norm->id, 'google_match', [
                         'confirmed_by_place_id' => true,
                         'place_id' => $placeId,
@@ -167,23 +203,19 @@ class AddressValidationService
                         ],
                     ];
                 }
-                // if place_id not found somehow -> continue normal flow
             }
 
             $candidates = $google['candidates'] ?? [];
 
-            // If Google returned single "valid", still treat it as candidate set
             if (($google['status'] ?? '') === 'valid' && !empty($google['data'])) {
                 $candidates = $candidates ?: [$google['data']];
             }
 
-            // Pick best candidate by score
             [$best, $bestScore, $gap] = $this->pickBestCandidateByScore($raw, $candidates);
 
             $minScore = (int) config('address_validation.auto_pick_min_score', 85);
             $minGap   = (int) config('address_validation.auto_pick_min_gap', 15);
 
-            // If confident => store + return valid
             if ($best && $bestScore >= $minScore && $gap >= $minGap) {
                 $d = $best;
 
@@ -232,8 +264,6 @@ class AddressValidationService
                 ];
             }
 
-            // Not confident => needs_confirmation
-            // ✅ DB enum issue avoid: log as 'manual' (allowed)
             $this->log($tenantId, $raw, null, null, 'manual', [
                 'top_score' => $bestScore,
                 'gap' => $gap,
@@ -251,6 +281,140 @@ class AddressValidationService
             Log::error('Validation error', ['msg' => $e->getMessage()]);
             return ['status' => 'error', 'error' => $e->getMessage()];
         }
+    }
+
+    // =========================================================
+    //  FUZZY DB MATCH HELPERS
+    // =========================================================
+
+    private function fuzzyNormalizedMatch(string $raw, string $canonicalKey): ?array
+    {
+        $enabled = (bool) config('address_validation.db_fuzzy_enabled', true);
+        if (!$enabled) return null;
+
+        $rawTokens = array_values(array_filter(explode(' ', $canonicalKey)));
+        $rawNums   = $this->extractNumbers($raw);
+        $rawNumber = $rawNums[0] ?? null;
+
+        // pick significant tokens (avoid very common words)
+        $sigTokens = $this->pickSignificantTokens($rawTokens);
+
+        $limit   = (int) config('address_validation.db_fuzzy_candidate_limit', 50);
+        $minScore = (int) config('address_validation.db_fuzzy_min_score', 85);
+        $minGap   = (int) config('address_validation.db_fuzzy_min_gap', 10);
+        $minOverlap = (float) config('address_validation.db_fuzzy_min_overlap', 0.75);
+
+        // 1) First try: if number exists, restrict by number (fast + safe)
+        $cands = collect();
+        if ($rawNumber !== null) {
+            $q = NormalizedAddress::query()
+                ->with('masterAddress')
+                ->where('number', (string) $rawNumber);
+
+            // also add token ORs to avoid wrong same-number matches
+            $q->where(function ($sub) use ($sigTokens) {
+                foreach ($sigTokens as $t) {
+                    $sub->orWhere('canonical_key', 'LIKE', '%' . $this->escapeLike($t) . '%');
+                }
+            });
+
+            $cands = $q->limit($limit)->get();
+        }
+
+        // 2) Fallback: if no candidates found, search by tokens only
+        if ($cands->isEmpty()) {
+            if (empty($sigTokens)) return null;
+
+            $q = NormalizedAddress::query()
+                ->with('masterAddress')
+                ->whereNotNull('canonical_key')
+                ->where(function ($sub) use ($sigTokens, $rawNumber) {
+                    foreach ($sigTokens as $t) {
+                        $sub->orWhere('canonical_key', 'LIKE', '%' . $this->escapeLike($t) . '%');
+                    }
+                    if ($rawNumber !== null) {
+                        $sub->orWhere('canonical_key', 'LIKE', '%' . $this->escapeLike((string)$rawNumber) . '%');
+                    }
+                });
+
+            $cands = $q->limit($limit)->get();
+        }
+
+        if ($cands->isEmpty()) return null;
+
+        // score candidates
+        $scores = [];
+        foreach ($cands as $idx => $row) {
+            $scores[$idx] = $this->scoreDbCandidate($rawTokens, $rawNumber, $row, $minOverlap);
+        }
+
+        arsort($scores);
+        $indexes = array_keys($scores);
+
+        $bestIdx = $indexes[0] ?? null;
+        if ($bestIdx === null) return null;
+
+        $bestScore = (int) ($scores[$bestIdx] ?? 0);
+        $secondScore = isset($indexes[1]) ? (int) ($scores[$indexes[1]] ?? 0) : 0;
+        $gap = $bestScore - $secondScore;
+
+        if ($bestScore >= $minScore && $gap >= $minGap) {
+            return [$cands[$bestIdx], $bestScore, $gap];
+        }
+
+        return null;
+    }
+
+    private function scoreDbCandidate(array $rawTokens, ?string $rawNumber, NormalizedAddress $row, float $minOverlap): int
+    {
+        // hard rule: number must match if both exist
+        $rowNumber = $row->number !== null ? (string) $row->number : null;
+        if ($rawNumber !== null && $rowNumber !== null && $rawNumber !== $rowNumber) {
+            return 0;
+        }
+
+        $candText = (string) ($row->canonical_key ?? $row->validated_address ?? $row->original_address ?? '');
+        $candTokens = $this->tokenize($candText);
+
+        $overlap = $this->tokenOverlapScore($rawTokens, $candTokens);
+        if ($overlap < $minOverlap) return 0;
+
+        $score = (int) round($overlap * 100);
+
+        // small trust boost (optional)
+        $m = $row->masterAddress;
+        if ($m && !empty($m->is_trusted)) $score += 5;
+        if ($m && (int) ($m->validation_count ?? 0) >= (int) config('address_validation.trust_threshold', 5)) $score += 3;
+
+        return max(0, min(100, $score));
+    }
+
+    private function pickSignificantTokens(array $tokens): array
+    {
+        $stop = [
+            'av', 'ave', 'avenida', 'street', 'st', 'road', 'rd', 'calle', 'pje', 'pasaje', 'dept', 'depto',
+            'chile', 'region', 'provincia', 'comuna'
+        ];
+
+        $filtered = [];
+        foreach ($tokens as $t) {
+            $t = trim($t);
+            if ($t === '') continue;
+            if (ctype_digit($t)) continue;
+            if (mb_strlen($t) < 4) continue; // keep meaningful words only
+            if (in_array($t, $stop, true)) continue;
+            $filtered[] = $t;
+        }
+
+        // Prefer longest tokens first (better filtering)
+        usort($filtered, fn($a, $b) => mb_strlen($b) <=> mb_strlen($a));
+
+        return array_slice(array_values(array_unique($filtered)), 0, 4);
+    }
+
+    private function escapeLike(string $v): string
+    {
+        return str_replace(['\\', '%', '_'], ['\\\\', '\%', '\_'], $v);
     }
 
     // ---------- unchanged helpers (your existing methods) ----------
@@ -389,12 +553,10 @@ class AddressValidationService
 
         $types = $candidate['types'] ?? [];
 
-        // HARD RULE #1: If raw has number and candidate has street_number, MUST MATCH
         if (!empty($rawNums) && !empty($streetNo) && (string)$rawNums[0] !== (string)$streetNo) {
             return 0;
         }
 
-        // HARD RULE #2: Reject POI/establishment unless it looks address-like
         $isPoi = is_array($types) && (in_array('point_of_interest', $types, true) || in_array('establishment', $types, true));
         $looksAddressLike = $this->looksLikeAddress($components, $types);
 
@@ -404,12 +566,10 @@ class AddressValidationService
 
         $score = 0;
 
-        // Street number match gives strong confidence
         if (!empty($rawNums) && !empty($streetNo) && (string)$rawNums[0] === (string)$streetNo) {
             $score += 40;
         }
 
-        // Route overlap
         if (!empty($route)) {
             $routeTokens = $this->tokenize($route);
             $score += (int) round($this->tokenOverlapScore($rawTokens, $routeTokens) * 30);
@@ -417,7 +577,6 @@ class AddressValidationService
             $score += (int) round($this->tokenOverlapScore($rawTokens, $fmtTokens) * 20);
         }
 
-        // Overall overlap
         $score += (int) round($this->tokenOverlapScore($rawTokens, $fmtTokens) * 30);
 
         if ($looksAddressLike) $score += 10;
