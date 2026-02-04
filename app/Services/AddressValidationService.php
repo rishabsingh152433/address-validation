@@ -110,8 +110,27 @@ class AddressValidationService
             }
 
             // 2) master LIKE fallback
+            //$likeRaw = '%' . str_replace(['%','_'], ['\%','\_'], $raw) . '%';
+            //$master = MasterAddress::where('formatted_address', 'LIKE', $likeRaw)->first();
+
+
             $likeRaw = '%' . str_replace(['%','_'], ['\%','\_'], $raw) . '%';
-            $master = MasterAddress::where('formatted_address', 'LIKE', $likeRaw)->first();
+
+    //  $master = MasterAddress::query()
+    // ->where('formatted_address', 'LIKE', $likeRaw)
+    // ->orWhereRaw('LOWER(?) LIKE CONCAT("%", LOWER(formatted_address), "%")', [mb_strtolower($raw)])
+    // ->first();
+
+    $rawLower = mb_strtolower($raw);
+
+$master = MasterAddress::query()
+    ->where('formatted_address', 'LIKE', $likeRaw)
+    ->orWhereRaw(
+        'LOWER(?) LIKE \'%\' || LOWER(formatted_address) || \'%\'',
+        [$rawLower]
+    )
+    ->first();
+
 
             if ($master) {
                 $norm = $this->upsertNormalized(
@@ -213,7 +232,7 @@ class AddressValidationService
 
             [$best, $bestScore, $gap] = $this->pickBestCandidateByScore($raw, $candidates);
 
-            $minScore = (int) config('address_validation.auto_pick_min_score', 85);
+            $minScore = (int) config('address_validation.auto_pick_min_score', 80);
             $minGap   = (int) config('address_validation.auto_pick_min_gap', 15);
 
             if ($best && $bestScore >= $minScore && $gap >= $minGap) {
@@ -300,7 +319,7 @@ class AddressValidationService
         $sigTokens = $this->pickSignificantTokens($rawTokens);
 
         $limit   = (int) config('address_validation.db_fuzzy_candidate_limit', 50);
-        $minScore = (int) config('address_validation.db_fuzzy_min_score', 85);
+        $minScore = (int) config('address_validation.db_fuzzy_min_score', 80);
         $minGap   = (int) config('address_validation.db_fuzzy_min_gap', 10);
         $minOverlap = (float) config('address_validation.db_fuzzy_min_overlap', 0.75);
 
@@ -451,20 +470,40 @@ class AddressValidationService
         );
     }
 
+    // private function canonicalKey(string $raw): string
+    // {
+    //     if (mb_strlen($raw) > 10000) $raw = mb_substr($raw, 0, 10000);
+
+    //     $s = Str::of($raw)->lower();
+    //     $s = Str::ascii((string) $s);
+    //     $s = preg_replace('/[^\pL\pN\s]/u', ' ', $s);
+    //     $s = preg_replace('/\s+/', ' ', trim($s));
+
+    //     $tokens = explode(' ', $s);
+    //     $tokens = array_values(array_filter($tokens, fn ($t) => $t !== ''));
+
+    //     sort($tokens, SORT_STRING);
+    //     return implode(' ', $tokens);
+    // }
+
+
     private function canonicalKey(string $raw): string
-    {
-        if (mb_strlen($raw) > 10000) $raw = mb_substr($raw, 0, 10000);
+   {
+    if (mb_strlen($raw) > 10000) $raw = mb_substr($raw, 0, 10000);
 
-        $s = Str::of($raw)->lower();
-        $s = Str::ascii((string) $s);
-        $s = preg_replace('/[^\pL\pN\s]/u', ' ', $s);
-        $s = preg_replace('/\s+/', ' ', trim($s));
+    $s = Str::of($raw)->lower();
+    $s = Str::ascii((string) $s);
+    $s = preg_replace('/[^\pL\pN\s]/u', ' ', $s);
+    $s = preg_replace('/\s+/', ' ', trim($s));
 
-        $tokens = explode(' ', $s);
-        $tokens = array_values(array_filter($tokens, fn ($t) => $t !== ''));
+    $tokens = array_values(array_filter(explode(' ', $s), fn($t) => $t !== ''));
 
-        sort($tokens, SORT_STRING);
-        return implode(' ', $tokens);
+    // ✅ ignore location/country filler words
+    $stop = ['chile','region','provincia','comuna','metropolitana','región'];
+    $tokens = array_values(array_filter($tokens, fn($t) => !in_array($t, $stop, true)));
+
+    sort($tokens, SORT_STRING);
+    return implode(' ', $tokens);
     }
 
     private function canonicalHash(string $canonicalKey): string
