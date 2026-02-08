@@ -6,7 +6,6 @@ use App\Models\AddressConfirmationCount;
 use App\Models\MasterAddress;
 use App\Models\NormalizedAddress;
 use App\Models\AddressValidationLog;
-use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Log;
 use Illuminate\Support\Str;
 
@@ -34,8 +33,6 @@ class AddressValidationService
             // 0) canonical cache (exact)
             $normRow = NormalizedAddress::where('canonical_key_hash', $canonicalHash)->first();
             if ($normRow) {
-                // ✅ If already promoted to master, we can auto-return valid.
-                if (!empty($normRow->master_address_id)) {
                 $this->log($tenantId, $raw, $normRow->master_address_id, $normRow->id, 'normalized_match', [
                     'matched_by' => 'canonical_hash_exact'
                 ]);
@@ -45,25 +42,13 @@ class AddressValidationService
                     'status' => 'valid',
                     'source' => 'canonical',
                     'data' => [
-                            'normalize_id' => $normRow->id,
-                            'master_address_id' => $normRow->master_address_id,
+                        'normalize_id'=>$normRow->id,
+                        'master_address_id'=>$normRow->master_address_id,
                         'formatted_address' => $normRow->validated_address ?? $normRow->masterAddress?->formatted_address,
                         'latitude' => $normRow->google_lat ?? $normRow->masterAddress?->google_lat,
                         'longitude' => $normRow->google_lng ?? $normRow->masterAddress?->google_lng,
                     ],
                 ];
-                }
-
-                // ✅ If cached with place_id but not promoted yet, DO NOT auto-validate.
-                if (empty($placeId) && !empty($normRow->place_id)) {
-                    $this->log($tenantId, $raw, null, $normRow->id, 'manual', [
-                        'matched_by' => 'canonical_hash_cached_place_id',
-                        'place_id' => $normRow->place_id,
-                    ]);
-
-                    return $this->pendingMasterPromotionResponse($tenantId, $normRow);
-                }
-                // else: keep going (we don't have enough info to confirm without Google)
             }
 
             // 1) legacy normalized_key (exact)
@@ -75,7 +60,6 @@ class AddressValidationService
                     $normRow->save();
                 }
 
-                if (!empty($normRow->master_address_id)) {
                 $this->log($tenantId, $raw, $normRow->master_address_id, $normRow->id, 'normalized_match', [
                     'matched_by' => 'normalized_key_exact'
                 ]);
@@ -85,22 +69,13 @@ class AddressValidationService
                     'status' => 'valid',
                     'source' => 'normalized',
                     'data' => [
-                            'normalize_id' => $normRow->id,
-                            'master_address_id' => $normRow->master_address_id,
+                        'normalize_id'=>$normRow->id,
+                        'master_address_id'=>$normRow->master_address_id,
                         'formatted_address' => $normRow->validated_address ?? $normRow->masterAddress?->formatted_address,
                         'latitude' => $normRow->google_lat ?? $normRow->masterAddress?->google_lat,
                         'longitude' => $normRow->google_lng ?? $normRow->masterAddress?->google_lng,
                     ],
                 ];
-                }
-
-                if (empty($placeId) && !empty($normRow->place_id)) {
-                    $this->log($tenantId, $raw, null, $normRow->id, 'manual', [
-                        'matched_by' => 'normalized_key_cached_place_id',
-                        'place_id' => $normRow->place_id,
-                    ]);
-                    return $this->pendingMasterPromotionResponse($tenantId, $normRow);
-                }
             }
 
             // =========================================================
@@ -125,7 +100,6 @@ class AddressValidationService
                     'gap' => $gap,
                 ]);
 
-                if (!empty($row->master_address_id)) {
                 $this->bumpTrustFromMatch($row, $row->masterAddress);
 
                 return [
@@ -133,18 +107,13 @@ class AddressValidationService
                     'source' => 'canonical_fuzzy',
                     'confidence' => $score,
                     'data' => [
-                            'normalize_id' => $row->id,
-                            'master_address_id' => $row->master_address_id,
+                        'normalize_id'=>$row->id,
+                        'master_address_id'=>$row->master_address_id,
                         'formatted_address' => $row->validated_address ?? $row->masterAddress?->formatted_address,
                         'latitude' => $row->google_lat ?? $row->masterAddress?->google_lat,
                         'longitude' => $row->google_lng ?? $row->masterAddress?->google_lng,
                     ],
                 ];
-                }
-
-                if (empty($placeId) && !empty($row->place_id)) {
-                    return $this->pendingMasterPromotionResponse($tenantId, $row);
-                }
             }
 
             // 2) master LIKE fallback
@@ -160,21 +129,13 @@ class AddressValidationService
     // ->first();
 
     $rawLower = mb_strtolower($raw);
-            $threshold = $this->promotionThreshold();
 
 $master = MasterAddress::query()
-                ->where(function ($q) use ($likeRaw, $rawLower) {
-                    $q->where('formatted_address', 'LIKE', $likeRaw)
+    ->where('formatted_address', 'LIKE', $likeRaw)
     ->orWhereRaw(
         'LOWER(?) LIKE \'%\' || LOWER(formatted_address) || \'%\'',
         [$rawLower]
-                      );
-                })
-                // ✅ Only trusted masters are allowed to auto-validate
-                ->where(function ($q) use ($threshold) {
-                    $q->where('is_trusted', true)
-                      ->orWhere('validation_count', '>=', $threshold);
-                })
+    )
     ->first();
 
 
@@ -206,57 +167,6 @@ $master = MasterAddress::query()
             }
 
             // 3) Google resolve
-            // ✅ Cost optimization: if this is a place_id confirmation and we already cached
-            // that place_id (lat/lng + formatted_address), we can confirm WITHOUT calling Google.
-            if (!empty($placeId)) {
-                $cached = NormalizedAddress::where('place_id', $placeId)->first();
-                if ($cached && !empty($cached->validated_address)) {
-                    $cachedCandidate = [
-                        'place_id' => $placeId,
-                        'formatted_address' => $cached->validated_address,
-                        'latitude' => $cached->google_lat,
-                        'longitude' => $cached->google_lng,
-                        'components' => [],
-                        'types' => [],
-                    ];
-
-                    [$count, $threshold, $master, $norm] = $this->confirmPlaceIdAndMaybePromote(
-                        tenantId: $tenantId,
-                        raw: $raw,
-                        normalized: $normalized,
-                        placeId: $placeId,
-                        candidate: $cachedCandidate,
-                        canonicalKey: $canonicalKey,
-                        canonicalHash: $canonicalHash
-                    );
-
-                    $this->log($tenantId, $raw, $master?->id, $norm->id, 'google_match', [
-                        'confirmed_by_place_id' => true,
-                        'place_id' => $placeId,
-                        'confirmed_count' => $count,
-                        'required_confirmations' => $threshold,
-                        'master_promoted' => (bool) $master,
-                        'from_cache' => true,
-                    ]);
-
-                    return [
-                        'status' => 'valid',
-                        'source' => $master ? 'place_id_confirmed_cached_master_promoted' : 'place_id_confirmed_cached_pending_master',
-                        'confirmed_count' => $count,
-                        'required_confirmations' => $threshold,
-                        'master_ready' => (bool) $master,
-                        'data' => [
-                            'normalize_id' => $norm->id,
-                            'master_address_id' => $master?->id,
-                            'formatted_address' => $cachedCandidate['formatted_address'],
-                            'latitude' => $cachedCandidate['latitude'],
-                            'longitude' => $cachedCandidate['longitude'],
-                            'place_id' => $placeId,
-                        ],
-                    ];
-                }
-            }
-
             $maxCandidates = (int) config('address_validation.max_candidates', 5);
             $google = $this->mapsClient->resolve($raw, $placeId, $maxCandidates);
 
@@ -265,7 +175,7 @@ $master = MasterAddress::query()
                 return ['status' => 'invalid'];
             }
 
-            // ✅ place_id confirm flow (counts confirmations; promote to master only when >= threshold)
+            //  place_id confirm flow (unchanged)
             if (!empty($placeId)) {
                 $d = $google['data'] ?? null;
 
@@ -279,37 +189,45 @@ $master = MasterAddress::query()
                 }
 
                 if (!empty($d)) {
-                    [$count, $threshold, $master, $norm] = $this->confirmPlaceIdAndMaybePromote(
-                        tenantId: $tenantId,
-                        raw: $raw,
-                        normalized: $normalized,
-                        placeId: $placeId,
-                        candidate: $d,
-                        canonicalKey: $canonicalKey,
-                        canonicalHash: $canonicalHash
+                    $master = MasterAddress::firstOrCreate(
+                        ['formatted_address' => $d['formatted_address'] ?? $raw],
+                        [
+                            'google_lat' => $d['latitude'] ?? null,
+                            'google_lng' => $d['longitude'] ?? null,
+                            'source'     => 'api',
+                            'validation_count' => 1,
+                            'is_trusted' => false,
+                            'concordance_level' => 0,
+                        ]
                     );
 
-                    $this->log($tenantId, $raw, $master?->id, $norm->id, 'google_match', [
+                    $norm = $this->upsertNormalized(
+                        $normalized,
+                        $master,
+                        $d['formatted_address'] ?? null,
+                        $d['latitude'] ?? null,
+                        $d['longitude'] ?? null,
+                        $canonicalKey,
+                        $canonicalHash
+                    );
+
+                    $this->log($tenantId, $raw, $master->id, $norm->id, 'google_match', [
                         'confirmed_by_place_id' => true,
                         'place_id' => $placeId,
-                        'confirmed_count' => $count,
-                        'required_confirmations' => $threshold,
-                        'master_promoted' => (bool) $master,
                     ]);
+
+                    $this->bumpTrustFromMatch($norm, $master);
 
                     return [
                         'status' => 'valid',
-                        'source' => $master ? 'google_place_id_confirmed_master_promoted' : 'google_place_id_confirmed_pending_master',
-                        'confirmed_count' => $count,
-                        'required_confirmations' => $threshold,
-                        'master_ready' => (bool) $master,
+                        'source' => 'google_place_id_confirmed',
                         'data' => [
                             'normalize_id' => $norm->id,
-                            'master_address_id' => $master?->id,
+                            'master_address_id' => $master->id,
                             'formatted_address' => $d['formatted_address'] ?? null,
                             'latitude' => $d['latitude'] ?? null,
                             'longitude' => $d['longitude'] ?? null,
-                            'place_id' => $d['place_id'] ?? $placeId,
+                            'place_id' => $d['place_id'] ?? null,
                             'components' => $d['components'] ?? [],
                             'types' => $d['types'] ?? [],
                         ],
@@ -328,30 +246,56 @@ $master = MasterAddress::query()
             $minScore = (int) config('address_validation.auto_pick_min_score', 80);
             $minGap   = (int) config('address_validation.auto_pick_min_gap', 15);
 
-            // ✅ Even if we have a very strong candidate, we DO NOT auto-add to master.
-            // We cache the best candidate (place_id + lat/lng) to avoid future Google calls,
-            // but we still require place_id confirmation (x/5) before master promotion.
             if ($best && $bestScore >= $minScore && $gap >= $minGap) {
                 $d = $best;
 
+                $master = MasterAddress::firstOrCreate(
+                    ['formatted_address' => $d['formatted_address'] ?? $raw],
+                    [
+                        'google_lat' => $d['latitude'] ?? null,
+                        'google_lng' => $d['longitude'] ?? null,
+                        'source'     => 'api',
+                        'validation_count' => 1,
+                        'is_trusted' => false,
+                        'concordance_level' => 0,
+                    ]
+                );
+
                 $norm = $this->upsertNormalized(
                     $normalized,
-                    null,
+                    $master,
                     $d['formatted_address'] ?? null,
                     $d['latitude'] ?? null,
                     $d['longitude'] ?? null,
                     $canonicalKey,
-                    $canonicalHash,
-                    $d['place_id'] ?? null
+                    $canonicalHash
                 );
 
-                $this->log($tenantId, $raw, null, $norm->id, 'manual', [
-                    'top_score' => $bestScore,
+                $this->log($tenantId, $raw, $master->id, $norm->id, 'google_match', [
+                    'score' => $bestScore,
                     'gap' => $gap,
-                    'suggested_place_id' => $d['place_id'] ?? null,
+                    'picked' => $d,
                 ]);
-            }
 
+                $this->bumpTrustFromMatch($norm, $master);
+
+                return [
+                    'status' => 'valid',
+                    'source' => 'google_places_scored',
+                    'confidence' => $bestScore,
+                    'data' => [
+                        'normalize_id' => $norm->id,
+                        'master_address_id' => $master->id,
+                        'formatted_address' => $d['formatted_address'] ?? null,
+                        'latitude' => $d['latitude'] ?? null,
+                        'longitude' => $d['longitude'] ?? null,
+                        'place_id' => $d['place_id'] ?? null,
+                        'components' => $d['components'] ?? [],
+                        'types' => $d['types'] ?? [],
+                    ],
+                ];
+            }
+            // google_ambiguous
             $this->log($tenantId, $raw, null, null, 'manual', [
                 'top_score' => $bestScore,
                 'gap' => $gap,
@@ -369,147 +313,6 @@ $master = MasterAddress::query()
             Log::error('Validation error', ['msg' => $e->getMessage()]);
             return ['status' => 'error', 'error' => $e->getMessage()];
         }
-    }
-
-    // =========================================================
-    //  NEW: 5 confirmations gate before promoting into master
-    // =========================================================
-
-    private function promotionThreshold(): int
-    {
-        return (int) config('address_validation.trust_threshold', 5);
-    }
-
-    private function confirmedCountForPlaceId(string $placeId): int
-    {
-        return (int) (AddressConfirmationCount::where('place_id', $placeId)->value('confirmation_count') ?? 0);
-    }
-
-    /**
-     * If a NormalizedAddress has place_id but no master_address_id,
-     * we must NOT auto-validate. We return needs_confirmation (cached) without hitting Google.
-     */
-    private function pendingMasterPromotionResponse(?int $tenantId, NormalizedAddress $row): array
-    {
-        $threshold = $this->promotionThreshold();
-        $count = !empty($row->place_id) ? $this->confirmedCountForPlaceId($row->place_id) : 0;
-
-        return [
-            'status' => 'needs_confirmation',
-            'source' => 'cached_pending_master_promotion',
-            'message' => 'Confirm this address to promote it into master table.',
-            'confirmed_count' => $count,
-            'required_confirmations' => $threshold,
-            'suggested_place_id' => $row->place_id,
-            'candidates' => array_values(array_filter([
-                [
-                    'formatted_address' => $row->validated_address,
-                    'latitude' => $row->google_lat,
-                    'longitude' => $row->google_lng,
-                    'place_id' => $row->place_id,
-                ],
-            ])),
-        ];
-    }
-
-    /**
-     * Increment confirmations for place_id and promote to master only when count >= threshold.
-     * Returns: [confirmed_count, threshold, master|null, normalizedRow]
-     */
-    private function confirmPlaceIdAndMaybePromote(
-        ?int $tenantId,
-        string $raw,
-        array $normalized,
-        string $placeId,
-        array $candidate,
-        string $canonicalKey,
-        string $canonicalHash
-    ): array {
-        $threshold = $this->promotionThreshold();
-
-        return DB::transaction(function () use ($tenantId, $raw, $normalized, $placeId, $candidate, $canonicalKey, $canonicalHash, $threshold) {
-            // If already linked to master via any cached row, treat as already promoted.
-            $existingMasterId = NormalizedAddress::where('place_id', $placeId)
-                ->whereNotNull('master_address_id')
-                ->value('master_address_id');
-            $master = $existingMasterId ? MasterAddress::find($existingMasterId) : null;
-
-            // Counter (lock to prevent race conditions)
-            $counter = AddressConfirmationCount::where('place_id', $placeId)->lockForUpdate()->first();
-            if (!$counter) {
-                // If two requests create at the same time, the unique(place_id) can throw.
-                // In that case, re-fetch and continue.
-                try {
-                    $counter = AddressConfirmationCount::create([
-                        'place_id' => $placeId,
-                        'confirmation_count' => 0,
-                        'first_confirmed_at' => now(),
-                        'last_confirmed_at' => now(),
-                    ]);
-                } catch (\Throwable $e) {
-                    $counter = AddressConfirmationCount::where('place_id', $placeId)->lockForUpdate()->first();
-                    if (!$counter) {
-                        throw $e;
-                    }
-                }
-            }
-
-            $counter->confirmation_count = (int) $counter->confirmation_count + 1;
-            $counter->first_confirmed_at = $counter->first_confirmed_at ?: now();
-            $counter->last_confirmed_at = now();
-            $counter->save();
-
-            // Promote to master only when eligible (and not already promoted)
-            if (!$master && (int) $counter->confirmation_count >= $threshold) {
-                $formatted = $candidate['formatted_address'] ?? $raw;
-
-                $master = MasterAddress::firstOrCreate(
-                    ['formatted_address' => $formatted],
-                    [
-                        'google_lat' => $candidate['latitude'] ?? null,
-                        'google_lng' => $candidate['longitude'] ?? null,
-                        'source' => 'api',
-                        'validation_count' => $threshold,
-                        'is_trusted' => true,
-                        'concordance_level' => 0,
-                        'last_validated_at' => now(),
-                        'tenant_id' => $tenantId,
-                    ]
-                );
-
-                // Ensure trusted even if it already existed
-                $master->validation_count = max((int) $master->validation_count, $threshold);
-                $master->is_trusted = true;
-                $master->last_validated_at = now();
-                $master->tenant_id = $master->tenant_id ?? $tenantId;
-                if (empty($master->google_lat)) $master->google_lat = $candidate['latitude'] ?? null;
-                if (empty($master->google_lng)) $master->google_lng = $candidate['longitude'] ?? null;
-                $master->save();
-
-                // Link all cached normalized rows for this place_id to the master
-                NormalizedAddress::where('place_id', $placeId)
-                    ->update(['master_address_id' => $master->id]);
-            }
-
-            // Upsert the canonical row for this raw address
-            $norm = $this->upsertNormalized(
-                $normalized,
-                $master,
-                $candidate['formatted_address'] ?? null,
-                $candidate['latitude'] ?? null,
-                $candidate['longitude'] ?? null,
-                $canonicalKey,
-                $canonicalHash,
-                $placeId
-            );
-
-            if ($master && empty($norm->master_address_id)) {
-                $norm->master_address_id = $master->id;
-                $norm->save();
-            }
-
-            return [(int) $counter->confirmation_count, $threshold, $master, $norm];
-        });
     }
 
     // =========================================================
@@ -655,8 +458,7 @@ $master = MasterAddress::query()
         ?float $lat,
         ?float $lng,
         string $canonicalKey,
-        string $canonicalHash,
-        ?string $placeId = null
+        string $canonicalHash
     ): NormalizedAddress {
         $street = trim(preg_replace('/\s+/', ' ', strtolower($normalized['components']['street'] ?? '')));
         $number = trim((string) ($normalized['components']['number'] ?? ''));
@@ -671,7 +473,6 @@ $master = MasterAddress::query()
                 'normalized_key'     => $legacyKey,
                 'original_address'   => $normalized['original'] ?? null,
                 'validated_address'  => $validatedAddress,
-                'place_id'           => $placeId,
                 'street'             => $street ?: null,
                 'number'             => $number ?: null,
                 'unit'               => $unit ?: null,

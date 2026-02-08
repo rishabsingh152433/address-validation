@@ -1,7 +1,8 @@
 <?php
 
 namespace App\Services;
-
+use App\Models\GoogleApiHitCounter;
+use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Http;
 
 class GoogleMapsClient
@@ -28,6 +29,43 @@ class GoogleMapsClient
         }
         return false;
     }
+
+
+   private function hitDb(string $endpoint): void
+    {
+        $date = now()->toDateString();
+
+        DB::transaction(function () use ($date, $endpoint) {
+
+            $row = GoogleApiHitCounter::where('hit_date', $date)
+                ->where('endpoint', $endpoint)
+                ->lockForUpdate()
+                ->first();
+
+            if ($row) {
+                $row->increment('hits');
+                return;
+            }
+
+            try {
+                GoogleApiHitCounter::create([
+                    'hit_date' => $date,
+                    'endpoint' => $endpoint,
+                    'hits' => 1,
+                ]);
+            } catch (\Illuminate\Database\QueryException $e) {
+                // if another request created it at same time
+                $row2 = GoogleApiHitCounter::where('hit_date', $date)
+                    ->where('endpoint', $endpoint)
+                    ->lockForUpdate()
+                    ->first();
+
+                if ($row2) $row2->increment('hits');
+            }
+        }, 1);
+    }
+
+
 
     /**
      * ✅ We will NOT expose candidates if:
@@ -193,6 +231,7 @@ class GoogleMapsClient
 
     private function autocompleteAddress(string $input): array
     {
+         $this->hitDb('autocomplete');
         return Http::timeout($this->timeout)->retry(2, 200)->get(
             'https://maps.googleapis.com/maps/api/place/autocomplete/json',
             [
@@ -206,6 +245,7 @@ class GoogleMapsClient
 
     private function findPlaceFromText(string $input): array
     {
+        $this->hitDb('find_place');
         return Http::timeout($this->timeout)->retry(2, 200)->get(
             'https://maps.googleapis.com/maps/api/place/findplacefromtext/json',
             [
@@ -221,6 +261,7 @@ class GoogleMapsClient
 
     private function placeDetails(string $placeId): array
     {
+        $this->hitDb('place_details');
         return Http::timeout($this->timeout)->retry(2, 200)->get(
             'https://maps.googleapis.com/maps/api/place/details/json',
             [
@@ -233,6 +274,7 @@ class GoogleMapsClient
 
     private function geocode(string $address): array
     {
+        $this->hitDb('geocode');
         return Http::timeout($this->timeout)->retry(2, 200)->get(
             'https://maps.googleapis.com/maps/api/geocode/json',
             [

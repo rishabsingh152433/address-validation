@@ -36,22 +36,22 @@ class AddressValidationService
             if ($normRow) {
                 // ✅ If already promoted to master, we can auto-return valid.
                 if (!empty($normRow->master_address_id)) {
-                $this->log($tenantId, $raw, $normRow->master_address_id, $normRow->id, 'normalized_match', [
-                    'matched_by' => 'canonical_hash_exact'
-                ]);
-                $this->bumpTrustFromMatch($normRow, $normRow->masterAddress);
+                    $this->log($tenantId, $raw, $normRow->master_address_id, $normRow->id, 'normalized_match', [
+                        'matched_by' => 'canonical_hash_exact'
+                    ]);
+                    $this->bumpTrustFromMatch($normRow, $normRow->masterAddress);
 
-                return [
-                    'status' => 'valid',
-                    'source' => 'canonical',
-                    'data' => [
+                    return [
+                        'status' => 'valid',
+                        'source' => 'canonical',
+                        'data' => [
                             'normalize_id' => $normRow->id,
                             'master_address_id' => $normRow->master_address_id,
-                        'formatted_address' => $normRow->validated_address ?? $normRow->masterAddress?->formatted_address,
-                        'latitude' => $normRow->google_lat ?? $normRow->masterAddress?->google_lat,
-                        'longitude' => $normRow->google_lng ?? $normRow->masterAddress?->google_lng,
-                    ],
-                ];
+                            'formatted_address' => $normRow->validated_address ?? $normRow->masterAddress?->formatted_address,
+                            'latitude' => $normRow->google_lat ?? $normRow->masterAddress?->google_lat,
+                            'longitude' => $normRow->google_lng ?? $normRow->masterAddress?->google_lng,
+                        ],
+                    ];
                 }
 
                 // ✅ If cached with place_id but not promoted yet, DO NOT auto-validate.
@@ -76,22 +76,22 @@ class AddressValidationService
                 }
 
                 if (!empty($normRow->master_address_id)) {
-                $this->log($tenantId, $raw, $normRow->master_address_id, $normRow->id, 'normalized_match', [
-                    'matched_by' => 'normalized_key_exact'
-                ]);
-                $this->bumpTrustFromMatch($normRow, $normRow->masterAddress);
+                    $this->log($tenantId, $raw, $normRow->master_address_id, $normRow->id, 'normalized_match', [
+                        'matched_by' => 'normalized_key_exact'
+                    ]);
+                    $this->bumpTrustFromMatch($normRow, $normRow->masterAddress);
 
-                return [
-                    'status' => 'valid',
-                    'source' => 'normalized',
-                    'data' => [
+                    return [
+                        'status' => 'valid',
+                        'source' => 'normalized',
+                        'data' => [
                             'normalize_id' => $normRow->id,
                             'master_address_id' => $normRow->master_address_id,
-                        'formatted_address' => $normRow->validated_address ?? $normRow->masterAddress?->formatted_address,
-                        'latitude' => $normRow->google_lat ?? $normRow->masterAddress?->google_lat,
-                        'longitude' => $normRow->google_lng ?? $normRow->masterAddress?->google_lng,
-                    ],
-                ];
+                            'formatted_address' => $normRow->validated_address ?? $normRow->masterAddress?->formatted_address,
+                            'latitude' => $normRow->google_lat ?? $normRow->masterAddress?->google_lat,
+                            'longitude' => $normRow->google_lng ?? $normRow->masterAddress?->google_lng,
+                        ],
+                    ];
                 }
 
                 if (empty($placeId) && !empty($normRow->place_id)) {
@@ -126,20 +126,20 @@ class AddressValidationService
                 ]);
 
                 if (!empty($row->master_address_id)) {
-                $this->bumpTrustFromMatch($row, $row->masterAddress);
+                    $this->bumpTrustFromMatch($row, $row->masterAddress);
 
-                return [
-                    'status' => 'valid',
-                    'source' => 'canonical_fuzzy',
-                    'confidence' => $score,
-                    'data' => [
+                    return [
+                        'status' => 'valid',
+                        'source' => 'canonical_fuzzy',
+                        'confidence' => $score,
+                        'data' => [
                             'normalize_id' => $row->id,
                             'master_address_id' => $row->master_address_id,
-                        'formatted_address' => $row->validated_address ?? $row->masterAddress?->formatted_address,
-                        'latitude' => $row->google_lat ?? $row->masterAddress?->google_lat,
-                        'longitude' => $row->google_lng ?? $row->masterAddress?->google_lng,
-                    ],
-                ];
+                            'formatted_address' => $row->validated_address ?? $row->masterAddress?->formatted_address,
+                            'latitude' => $row->google_lat ?? $row->masterAddress?->google_lat,
+                            'longitude' => $row->google_lng ?? $row->masterAddress?->google_lng,
+                        ],
+                    ];
                 }
 
                 if (empty($placeId) && !empty($row->place_id)) {
@@ -159,15 +159,15 @@ class AddressValidationService
     // ->orWhereRaw('LOWER(?) LIKE CONCAT("%", LOWER(formatted_address), "%")', [mb_strtolower($raw)])
     // ->first();
 
-    $rawLower = mb_strtolower($raw);
+            $rawLower = mb_strtolower($raw);
             $threshold = $this->promotionThreshold();
 
-$master = MasterAddress::query()
+            $master = MasterAddress::query()
                 ->where(function ($q) use ($likeRaw, $rawLower) {
                     $q->where('formatted_address', 'LIKE', $likeRaw)
-    ->orWhereRaw(
-        'LOWER(?) LIKE \'%\' || LOWER(formatted_address) || \'%\'',
-        [$rawLower]
+                      ->orWhereRaw(
+                          'LOWER(?) LIKE \'%\' || LOWER(formatted_address) || \'%\'',
+                          [$rawLower]
                       );
                 })
                 // ✅ Only trusted masters are allowed to auto-validate
@@ -175,7 +175,7 @@ $master = MasterAddress::query()
                     $q->where('is_trusted', true)
                       ->orWhere('validation_count', '>=', $threshold);
                 })
-    ->first();
+                ->first();
 
 
             if ($master) {

@@ -14,7 +14,19 @@ return [
     'trust_threshold' => env('ADDRESS_TRUST_THRESHOLD', 5),            // validations required to mark trusted
     'gps_concordance_meters' => env('GPS_CONCORDANCE_METERS', 50),     // meters for concordance
     'gps_discrepancy_events_threshold' => env('GPS_DISCREPANCY_THRESHOLD', 10), // events before admin review
+     // matching + google
+     'max_candidates' => env('ADDRESS_MAX_CANDIDATES', 5),
+    'auto_pick_min_score' => env('ADDRESS_AUTO_PICK_MIN_SCORE', 80),
+    'auto_pick_min_gap' => env('ADDRESS_AUTO_PICK_MIN_GAP', 15),
 
+    // DB fuzzy
+    'db_fuzzy_enabled' => env('ADDRESS_DB_FUZZY_ENABLED', true),
+    'db_fuzzy_candidate_limit' => env('ADDRESS_DB_FUZZY_CANDIDATE_LIMIT', 50),
+    'db_fuzzy_min_score' => env('ADDRESS_DB_FUZZY_MIN_SCORE', 80),
+    'db_fuzzy_min_gap' => env('ADDRESS_DB_FUZZY_MIN_GAP', 10),
+    'db_fuzzy_min_overlap' => env('ADDRESS_DB_FUZZY_MIN_OVERLAP', 0.75),
+     // optional: 1.5M scale pe master LIKE ko off kar sakte ho
+     'master_like_enabled' => env('ADDRESS_MASTER_LIKE_ENABLED', true),
     /*
     |--------------------------------------------------------------------------
     | Normalization / abbreviation mapping
