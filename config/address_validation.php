@@ -88,4 +88,5 @@ return [
     'cache' => [
         'normalized_ttl_seconds' => env('NORMALIZED_CACHE_TTL', 86400), // 1 day
     ],
+    'geo_registry_path' => env('ADDRESS_GEO_REGISTRY_PATH', resource_path('data/chile_regions_comunas.json')),
 ];

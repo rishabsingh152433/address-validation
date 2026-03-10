@@ -2,10 +2,10 @@
 
 namespace Database\Seeders;
 
-use App\Models\User;
+use App\Models\Tenant;
 use Illuminate\Database\Console\Seeds\WithoutModelEvents;
 use Illuminate\Database\Seeder;
-use App\Models\Tenant;
+
 class DatabaseSeeder extends Seeder
 {
     use WithoutModelEvents;
@@ -15,18 +15,17 @@ class DatabaseSeeder extends Seeder
      */
     public function run(): void
     {
-        // User::factory(10)->create();
-
-        // User::factory()->create([
-        //     'name' => 'Test User',
-        //     'email' => 'test@example.com',
-        // ]);
-
-        Tenant::firstOrCreate(['id' => 1], ['name' => 'Default Tenant']);
+        Tenant::firstOrCreate(
+            ['id' => 1],
+            [
+                'name' => 'Default Tenant',
+                'slug' => 'default',
+            ]
+        );
 
         $this->call([
-          MasterAddressSeeder::class,
-          NormalizedFromMasterSeeder::class,
+            MasterAddressSeeder::class,
+            NormalizedFromMasterSeeder::class,
         ]);
     }
 }
