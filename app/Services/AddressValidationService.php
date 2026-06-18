@@ -55,15 +55,17 @@ class AddressValidationService
                             return $this->normalizedValidResponse('canonical', $normRow);
                         }
 
-                        if (empty($placeId) && !empty($normRow->place_id)) {
-                            $this->log($tenantId, $raw, null, $normRow->id, 'manual', [
-                                'matched_by' => 'canonical_hash_cached_place_id',
-                                'place_id' => $normRow->place_id,
-                                'raw_geo' => $rawGeo,
-                                'candidate_geo' => $this->extractGeoFromNormalized($normRow),
-                            ]);
-
-                            return $this->pendingMasterPromotionResponse($tenantId, $normRow);
+                        if (empty($placeId) && empty($normRow->master_address_id)) {
+                            return $this->oldGooglePlacesFlowForPendingNormalized(
+                                tenantId: $tenantId,
+                                raw: $raw,
+                                normalized: $normalized,
+                                canonicalKey: $canonicalKey,
+                                canonicalHash: $canonicalHash,
+                                rawGeo: $rawGeo,
+                                pendingRow: $normRow,
+                                matchedBy: 'canonical_hash_pending_master'
+                            );
                         }
                     } else {
                         $this->logGeoRejectedCandidate($tenantId, $raw, $rawGeo, 'canonical_hash_exact_rejected', $normRow, $normRow->masterAddress);
@@ -90,15 +92,17 @@ class AddressValidationService
                             return $this->normalizedValidResponse('normalized', $normRow);
                         }
 
-                        if (empty($placeId) && !empty($normRow->place_id)) {
-                            $this->log($tenantId, $raw, null, $normRow->id, 'manual', [
-                                'matched_by' => 'normalized_key_cached_place_id',
-                                'place_id' => $normRow->place_id,
-                                'raw_geo' => $rawGeo,
-                                'candidate_geo' => $this->extractGeoFromNormalized($normRow),
-                            ]);
-
-                            return $this->pendingMasterPromotionResponse($tenantId, $normRow);
+                        if (empty($placeId) && empty($normRow->master_address_id)) {
+                            return $this->oldGooglePlacesFlowForPendingNormalized(
+                                tenantId: $tenantId,
+                                raw: $raw,
+                                normalized: $normalized,
+                                canonicalKey: $canonicalKey,
+                                canonicalHash: $canonicalHash,
+                                rawGeo: $rawGeo,
+                                pendingRow: $normRow,
+                                matchedBy: 'normalized_key_pending_master'
+                            );
                         }
                     } else {
                         $this->logGeoRejectedCandidate($tenantId, $raw, $rawGeo, 'normalized_key_exact_rejected', $normRow, $normRow->masterAddress);
@@ -131,8 +135,17 @@ class AddressValidationService
                             return $this->normalizedValidResponse('canonical_fuzzy', $row, $score);
                         }
 
-                        if (empty($placeId) && !empty($row->place_id)) {
-                            return $this->pendingMasterPromotionResponse($tenantId, $row);
+                        if (empty($placeId) && empty($row->master_address_id)) {
+                            return $this->oldGooglePlacesFlowForPendingNormalized(
+                                tenantId: $tenantId,
+                                raw: $raw,
+                                normalized: $normalized,
+                                canonicalKey: $canonicalKey,
+                                canonicalHash: $canonicalHash,
+                                rawGeo: $rawGeo,
+                                pendingRow: $row,
+                                matchedBy: 'fuzzy_pending_master'
+                            );
                         }
                     } else {
                         $this->logGeoRejectedCandidate($tenantId, $raw, $rawGeo, 'fuzzy_db_rejected', $row, $row->masterAddress, [
@@ -383,6 +396,93 @@ class AddressValidationService
     private function confirmedCountForPlaceId(string $placeId): int
     {
         return (int) (AddressConfirmationCount::where('place_id', $placeId)->value('confirmation_count') ?? 0);
+    }
+
+    /**
+     * When a normalized DB row exists but it is not linked to master_addresses yet,
+     * do NOT return cached_pending_master_promotion.
+     * Instead run the same old Google Places candidate flow by passing placeId = null.
+     * This keeps the frontend behavior: needs_confirmation + up to max_candidates Google candidates.
+     */
+    private function oldGooglePlacesFlowForPendingNormalized(
+        ?int $tenantId,
+        string $raw,
+        array $normalized,
+        string $canonicalKey,
+        string $canonicalHash,
+        array $rawGeo,
+        ?NormalizedAddress $pendingRow = null,
+        string $matchedBy = 'pending_normalized_without_master'
+    ): array {
+        $maxCandidates = (int) config('address_validation.max_candidates', 5);
+
+        // IMPORTANT: placeId must be null here.
+        // If cached place_id is passed, Google Place Details returns only one result.
+        // Null keeps the old flow: Autocomplete -> Find Place -> Details -> Geocode fallback.
+        $google = $this->mapsClient->resolve($raw, null, $maxCandidates);
+
+        if (empty($google['success'])) {
+            $this->log($tenantId, $raw, null, $pendingRow?->id, 'not_found', [
+                'matched_by' => $matchedBy . '_google_places_failed',
+                'cached_place_id' => $pendingRow?->place_id,
+                'raw_geo' => $rawGeo,
+                'google' => $google ?: [],
+            ]);
+
+            return ['status' => 'invalid'];
+        }
+
+        $candidates = $google['candidates'] ?? [];
+        if (($google['status'] ?? '') === 'valid' && !empty($google['data'])) {
+            $candidates = $candidates ?: [$google['data']];
+        }
+
+        [$best, $bestScore, $gap] = $this->pickBestCandidateByScore($raw, $candidates);
+        $minScore = (int) config('address_validation.auto_pick_min_score', 80);
+        $minGap = (int) config('address_validation.auto_pick_min_gap', 15);
+
+        if ($best && $bestScore >= $minScore && $gap >= $minGap) {
+            $norm = $this->upsertNormalized(
+                $normalized,
+                null,
+                $best['formatted_address'] ?? null,
+                $best['latitude'] ?? null,
+                $best['longitude'] ?? null,
+                $canonicalKey,
+                $canonicalHash,
+                $best['place_id'] ?? null
+            );
+
+            $this->log($tenantId, $raw, null, $norm->id, 'manual', [
+                'matched_by' => $matchedBy . '_google_places_best_cached',
+                'previous_normalized_id' => $pendingRow?->id,
+                'cached_place_id' => $pendingRow?->place_id,
+                'top_score' => $bestScore,
+                'gap' => $gap,
+                'suggested_place_id' => $best['place_id'] ?? null,
+                'raw_geo' => $rawGeo,
+                'candidate_geo' => $this->geoRegistry->extractFromComponents(
+                    $best['components'] ?? [],
+                    $best['formatted_address'] ?? null
+                ),
+            ]);
+        } else {
+            $this->log($tenantId, $raw, null, $pendingRow?->id, 'manual', [
+                'matched_by' => $matchedBy . '_google_places',
+                'cached_place_id' => $pendingRow?->place_id,
+                'top_score' => $bestScore,
+                'gap' => $gap,
+                'candidates_count' => count($candidates),
+                'raw_geo' => $rawGeo,
+            ]);
+        }
+
+        return [
+            'status' => 'needs_confirmation',
+            'source' => 'google_places',
+            'message' => 'Multiple/uncertain matches. Please select the correct address.',
+            'candidates' => $candidates,
+        ];
     }
 
     /**
